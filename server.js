@@ -8,11 +8,11 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
-// ✅ CORS для всех источников + preflight
+// ✅ CORS for all origins + preflight
 app.use(cors());
 app.options("*", cors());
 
-// ✅ JSON парсер
+// ✅ JSON parser
 app.use(express.json());
 
 // ✅ OpenAI SDK
@@ -20,12 +20,12 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// ✅ Эндпоинт чата
+// ✅ Chat endpoint
 app.post("/chat", async (req, res) => {
   const { messages } = req.body;
 
   if (!messages || !Array.isArray(messages)) {
-    return res.status(400).json({ error: "Некорректный формат messages" });
+    return res.status(400).json({ error: "Invalid messages format" });
   }
 
   try {
@@ -35,17 +35,17 @@ app.post("/chat", async (req, res) => {
     });
 
     const reply =
-      completion.choices?.[0]?.message?.content || "Ответ не получен";
+      completion.choices?.[0]?.message?.content || "No response received";
 
-    console.log("✅ Ответ:", reply.slice(0, 100) + "...");
+    console.log("✅ Reply:", reply.slice(0, 100) + "...");
     res.json({ reply });
   } catch (err) {
-    console.error("❌ Ошибка OpenAI:", err.message || err);
-    res.status(500).json({ error: "Ошибка при запросе к OpenAI" });
+    console.error("❌ OpenAI error:", err.message || err);
+    res.status(500).json({ error: "Error while requesting OpenAI" });
   }
 });
 
-// ✅ Запуск сервера
+// ✅ Start server
 app.listen(port, () => {
-  console.log(`🚀 Сервер запущен на http://localhost:${port}`);
+  console.log(`🚀 Server started at http://localhost:${port}`);
 });
