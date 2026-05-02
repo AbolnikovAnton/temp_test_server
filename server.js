@@ -9,14 +9,12 @@ const port = process.env.PORT || 3000;
 
 const config = {
   gemini: {
-    enabled: Boolean(process.env.GEMINI_API_KEY),
-    apiKey: process.env.GEMINI_API_KEY,
+    apiKey: process.env.GEMINI_API_KEY?.trim(),
     baseUrl: process.env.GEMINI_BASE_URL || "https://gemini.googleapis.com/v1",
     model: process.env.GEMINI_MODEL || "gemini-1.5-pro",
   },
   openrouter: {
-    enabled: Boolean(process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY),
-    apiKey: process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY,
+    apiKey: process.env.OPENAI_API_KEY?.trim(),
     baseUrl: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
     model: process.env.OPENROUTER_MODEL || "gpt-4o",
     maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 1024),
@@ -26,7 +24,7 @@ const config = {
 const providers = [
   {
     name: "gemini",
-    enabled: config.gemini.enabled,
+    enabled: Boolean(config.gemini.apiKey),
     request: async (messages) => {
       const prompt = messages
         .map((message) => {
@@ -65,7 +63,7 @@ const providers = [
   },
   {
     name: "openrouter",
-    enabled: config.openrouter.enabled,
+    enabled: Boolean(config.openrouter.apiKey),
     request: async (messages) => {
       const response = await fetch(`${config.openrouter.baseUrl}/chat/completions`, {
         method: "POST",
@@ -111,11 +109,11 @@ const getReply = async (messages) => {
   throw new Error(errors.length ? errors.join(" | ") : "No provider is configured");
 };
 
-if (!config.gemini.enabled) {
+if (!config.gemini.apiKey) {
   console.warn("⚠️ GEMINI_API_KEY is not configured — Gemini will be skipped.");
 }
-if (!config.openrouter.enabled) {
-  console.warn("⚠️ OPENROUTER_API_KEY or OPENAI_API_KEY is not configured — OpenRouter will be skipped.");
+if (!config.openrouter.apiKey) {
+  console.warn("⚠️ OPENAI_API_KEY is not configured — OpenRouter will be skipped.");
 }
 
 app.use(cors());
