@@ -33,7 +33,10 @@ const providers = [
         })
         .join("\n");
 
-      const response = await fetch(`${config.gemini.baseUrl}/models/${config.gemini.model}:generate`, {
+      const baseUrl = config.gemini.baseUrl.replace(/\/+$/, "");
+      const url = `${baseUrl}/models/${config.gemini.model}:generate`;
+
+      const response = await fetch(url, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -50,7 +53,8 @@ const providers = [
 
       const body = await response.text();
       if (!response.ok) {
-        throw new Error(`Gemini ${response.status}: ${body}`);
+        const fallbackHint = response.status === 404 ? "Check GEMINI_BASE_URL and GEMINI_MODEL." : "";
+        throw new Error(`Gemini ${response.status}: ${body} ${fallbackHint} URL: ${url}`);
       }
 
       const data = JSON.parse(body);
