@@ -10,8 +10,8 @@ const port = process.env.PORT || 3000;
 const config = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY?.trim(),
-    baseUrl: process.env.GEMINI_BASE_URL || "https://gemini.googleapis.com/v1",
-    model: process.env.GEMINI_MODEL || "gemini-1.5-pro",
+    baseUrl: process.env.GEMINI_BASE_URL?.trim(),
+    model: process.env.GEMINI_MODEL || "gemini-flash-latest",
   },
   openrouter: {
     apiKey: process.env.OPENAI_API_KEY?.trim(),
@@ -19,6 +19,12 @@ const config = {
     model: process.env.OPENROUTER_MODEL || "gpt-4o",
     maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 1024),
   },
+};
+
+const geminiAuth = (key) => {
+  if (!key) return { type: "none" };
+  if (/^AIza/.test(key)) return { type: "apiKey", key };
+  return { type: "bearer", key };
 };
 
 const providers = [
@@ -33,36 +39,53 @@ const providers = [
         })
         .join("\n");
 
-      const baseUrl = config.gemini.baseUrl.replace(/\/+$/, "");
-      const url = `${baseUrl}/models/${config.gemini.model}:generate`;
+      const auth = geminiAuth(config.gemini.apiKey);
+      const candidateBaseUrls = config.gemini.baseUrl
+        ? [config.gemini.baseUrl.replace(/\/+$/, "")]
+        : ["https://generativelanguage.googleapis.com/v1beta"];
 
-      const response = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.gemini.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: config.gemini.model,
-          temperature: 0.7,
-          maxOutputTokens: 1024,
-          candidateCount: 1,
-          input: { text: prompt },
-        }),
-      });
+      let lastError;
+      for (const baseUrl of candidateBaseUrls) {
+        const url = `${baseUrl}/models/${config.gemini.model}:generateContent`;
 
-      const body = await response.text();
-      if (!response.ok) {
-        const fallbackHint = response.status === 404 ? "Check GEMINI_BASE_URL and GEMINI_MODEL." : "";
-        throw new Error(`Gemini ${response.status}: ${body} ${fallbackHint} URL: ${url}`);
+        const response = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(auth.type === "bearer" ? { Authorization: `Bearer ${auth.key}` } : {}),
+            ...(auth.type === "apiKey" ? { "X-goog-api-key": auth.key } : {}),
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  { text: prompt },
+                ],
+              },
+            ],
+          }),
+        });
+
+        const body = await response.text();
+        if (!response.ok) {
+          lastError = new Error(
+            `Gemini ${response.status}: ${body} ${response.status === 404 ? "Check GEMINI_BASE_URL and GEMINI_MODEL." : ""} URL: ${url}`
+          );
+          if (response.status === 404 && !config.gemini.baseUrl) {
+            continue;
+          }
+          throw lastError;
+        }
+
+        const data = JSON.parse(body);
+        const text = data?.candidates?.[0]?.content?.[0]?.text || data?.outputs?.[0]?.content?.[0]?.text;
+        if (!text) {
+          throw new Error("Gemini returned no text");
+        }
+        return text;
       }
 
-      const data = JSON.parse(body);
-      const text = data.candidates?.[0]?.output?.[0]?.content?.[0]?.text;
-      if (!text) {
-        throw new Error("Gemini returned no text");
-      }
-      return text;
+      throw lastError || new Error("Gemini request failed");
     },
   },
   {
