@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
 
@@ -10,7 +11,6 @@ const port = process.env.PORT || 3000;
 const config = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY?.trim(),
-    baseUrl: process.env.GEMINI_BASE_URL?.trim(),
     model: process.env.GEMINI_MODEL || "gemini-flash-latest",
   },
   openrouter: {
@@ -21,11 +21,7 @@ const config = {
   },
 };
 
-const geminiAuth = (key) => {
-  if (!key) return { type: "none" };
-  if (/^AIza/.test(key)) return { type: "apiKey", key };
-  return { type: "bearer", key };
-};
+const ai = new GoogleGenAI({ apiKey: config.gemini.apiKey });
 
 const providers = [
   {
@@ -39,53 +35,16 @@ const providers = [
         })
         .join("\n");
 
-      const auth = geminiAuth(config.gemini.apiKey);
-      const candidateBaseUrls = config.gemini.baseUrl
-        ? [config.gemini.baseUrl.replace(/\/+$/, "")]
-        : ["https://generativelanguage.googleapis.com/v1beta"];
+      const response = await ai.models.generateContent({
+        model: config.gemini.model,
+        contents: prompt,
+      });
 
-      let lastError;
-      for (const baseUrl of candidateBaseUrls) {
-        const url = `${baseUrl}/models/${config.gemini.model}:generateContent`;
-
-        const response = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            ...(auth.type === "bearer" ? { Authorization: `Bearer ${auth.key}` } : {}),
-            ...(auth.type === "apiKey" ? { "X-goog-api-key": auth.key } : {}),
-          },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  { text: prompt },
-                ],
-              },
-            ],
-          }),
-        });
-
-        const body = await response.text();
-        if (!response.ok) {
-          lastError = new Error(
-            `Gemini ${response.status}: ${body} ${response.status === 404 ? "Check GEMINI_BASE_URL and GEMINI_MODEL." : ""} URL: ${url}`
-          );
-          if (response.status === 404 && !config.gemini.baseUrl) {
-            continue;
-          }
-          throw lastError;
-        }
-
-        const data = JSON.parse(body);
-        const text = data?.candidates?.[0]?.content?.[0]?.text || data?.outputs?.[0]?.content?.[0]?.text;
-        if (!text) {
-          throw new Error("Gemini returned no text");
-        }
-        return text;
+      const text = response.text || response.output?.[0]?.content?.[0]?.text;
+      if (!text) {
+        throw new Error(`Gemini returned no text. Response structure: ${JSON.stringify(response)}`);
       }
-
-      throw lastError || new Error("Gemini request failed");
+      return text;
     },
   },
   {
