@@ -103,7 +103,7 @@ if (!config.openrouter.apiKey) {
 }
 
 app.use(cors());
-app.options("*", cors());
+app.options("/*splat", cors());
 app.use(express.json());
 
 app.post("/chat", async (req, res) => {
