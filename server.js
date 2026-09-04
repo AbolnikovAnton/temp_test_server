@@ -12,13 +12,25 @@ const port = process.env.PORT || 3000;
 const config = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY?.trim(),
-    model: process.env.GEMINI_MODEL || "gemini-flash-latest",
+    // Tried in order. Google tracks free-tier quota separately PER MODEL, so
+    // this isn't just a fallback for outages — it's extra free daily
+    // capacity. A brand-new "-latest" alias tends to launch with a *smaller*
+    // introductory free quota than established models, so it goes first for
+    // quality but the list gives us somewhere to go once it's exhausted.
+    models: (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-2.5-flash,gemini-2.5-flash-lite")
+      .split(",")
+      .map((model) => model.trim())
+      .filter(Boolean),
     maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS || 1024),
   },
   openrouter: {
     apiKey: process.env.OPENAI_API_KEY?.trim(),
     baseUrl: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
-    model: process.env.OPENROUTER_MODEL || "gpt-4o",
+    // A ":free" OpenRouter model costs no credits, sidestepping the account
+    // balance entirely (20 req/min, 50/day — or 1000/day after a one-time
+    // $10 lifetime credit purchase, per OpenRouter's own docs). See
+    // https://openrouter.ai/models?variant=free for the current list.
+    model: process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
     maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 1024),
   },
 };
@@ -101,8 +113,13 @@ const PRICING_USD_PER_MILLION_TOKENS = {
 };
 
 function estimateCost(model, usage) {
+  if (!usage) return null;
+  // Any OpenRouter ":free" variant costs $0 by definition — no need to keep
+  // a pricing entry in sync for every free model someone might configure.
+  if (model?.endsWith(":free")) return 0;
+
   const pricing = PRICING_USD_PER_MILLION_TOKENS[model];
-  if (!pricing || !usage) return null;
+  if (!pricing) return null;
   return (
     (usage.inputTokens / 1_000_000) * pricing.input +
     (usage.outputTokens / 1_000_000) * pricing.output
@@ -135,7 +152,6 @@ function describeProviderError(providerName, err) {
 const providers = [
   {
     name: "gemini",
-    model: config.gemini.model,
     enabled: Boolean(config.gemini.apiKey),
     request: async (messages) => {
       const prompt = messages
@@ -145,28 +161,39 @@ const providers = [
         })
         .join("\n");
 
-      const response = await withRetries(() =>
-        ai.models.generateContent({
-          model: config.gemini.model,
-          contents: prompt,
-          config: { maxOutputTokens: config.gemini.maxOutputTokens },
-        }),
-      );
+      const modelErrors = [];
 
-      const text = response.text || response.output?.[0]?.content?.[0]?.text;
-      if (!text) {
-        throw new Error(`Gemini returned no text. Response structure: ${JSON.stringify(response)}`);
+      for (const model of config.gemini.models) {
+        try {
+          const response = await withRetries(() =>
+            ai.models.generateContent({
+              model,
+              contents: prompt,
+              config: { maxOutputTokens: config.gemini.maxOutputTokens },
+            }),
+          );
+
+          const text = response.text || response.output?.[0]?.content?.[0]?.text;
+          if (!text) {
+            throw new Error(`no text in response: ${JSON.stringify(response)}`);
+          }
+
+          const usageMeta = response.usageMetadata;
+          const usage = usageMeta
+            ? {
+                inputTokens: usageMeta.promptTokenCount || 0,
+                outputTokens: usageMeta.candidatesTokenCount || 0,
+              }
+            : null;
+
+          return { text, usage, model };
+        } catch (err) {
+          modelErrors.push(`${model}: ${err.message || err}`);
+          console.warn(`⚠️ Gemini model "${model}" failed, trying next:`, err.message || err);
+        }
       }
 
-      const usageMeta = response.usageMetadata;
-      const usage = usageMeta
-        ? {
-            inputTokens: usageMeta.promptTokenCount || 0,
-            outputTokens: usageMeta.candidatesTokenCount || 0,
-          }
-        : null;
-
-      return { text, usage };
+      throw new Error(modelErrors.join(" | "));
     },
     stream: async (messages, onDelta) => {
       const prompt = messages
@@ -176,44 +203,60 @@ const providers = [
         })
         .join("\n");
 
-      // Only the call that opens the stream is retried — once tokens have
-      // started reaching the client (below), a later failure is handled by
-      // the "startedStreaming" check in streamReply instead, not retried
-      // here with a fresh (and possibly duplicate) response.
-      const responseStream = await withRetries(() =>
-        ai.models.generateContentStream({
-          model: config.gemini.model,
-          contents: prompt,
-          config: { maxOutputTokens: config.gemini.maxOutputTokens },
-        }),
-      );
+      const modelErrors = [];
 
-      let usage = null;
-      let gotAnyText = false;
+      for (const model of config.gemini.models) {
+        let startedForThisModel = false;
+        try {
+          // Only the call that opens the stream is retried — once tokens
+          // have started reaching the client (below), a later failure ends
+          // the whole attempt instead of silently switching models or
+          // retrying with a fresh (and possibly duplicate) response.
+          const responseStream = await withRetries(() =>
+            ai.models.generateContentStream({
+              model,
+              contents: prompt,
+              config: { maxOutputTokens: config.gemini.maxOutputTokens },
+            }),
+          );
 
-      for await (const chunk of responseStream) {
-        if (chunk.text) {
-          gotAnyText = true;
-          onDelta(chunk.text);
-        }
-        if (chunk.usageMetadata) {
-          usage = {
-            inputTokens: chunk.usageMetadata.promptTokenCount || 0,
-            outputTokens: chunk.usageMetadata.candidatesTokenCount || 0,
-          };
+          let usage = null;
+          let gotAnyText = false;
+
+          for await (const chunk of responseStream) {
+            if (chunk.text) {
+              gotAnyText = true;
+              startedForThisModel = true;
+              onDelta(chunk.text);
+            }
+            if (chunk.usageMetadata) {
+              usage = {
+                inputTokens: chunk.usageMetadata.promptTokenCount || 0,
+                outputTokens: chunk.usageMetadata.candidatesTokenCount || 0,
+              };
+            }
+          }
+
+          if (!gotAnyText) {
+            throw new Error("streamed no text");
+          }
+
+          return { usage, model };
+        } catch (err) {
+          modelErrors.push(`${model}: ${err.message || err}`);
+          if (startedForThisModel) {
+            console.warn(`⚠️ Gemini model "${model}" failed mid-stream:`, err.message || err);
+            throw err;
+          }
+          console.warn(`⚠️ Gemini model "${model}" failed, trying next:`, err.message || err);
         }
       }
 
-      if (!gotAnyText) {
-        throw new Error("Gemini streamed no text");
-      }
-
-      return { usage };
+      throw new Error(modelErrors.join(" | "));
     },
   },
   {
     name: "openrouter",
-    model: config.openrouter.model,
     enabled: Boolean(config.openrouter.apiKey),
     request: async (messages) => {
       const response = await fetch(`${config.openrouter.baseUrl}/chat/completions`, {
@@ -248,7 +291,7 @@ const providers = [
           }
         : null;
 
-      return { text, usage };
+      return { text, usage, model: config.openrouter.model };
     },
     stream: async (messages, onDelta) => {
       const response = await fetch(`${config.openrouter.baseUrl}/chat/completions`, {
@@ -317,7 +360,7 @@ const providers = [
         throw new Error("OpenRouter streamed no text");
       }
 
-      return { usage };
+      return { usage, model: config.openrouter.model };
     },
   },
 ];
@@ -327,13 +370,13 @@ const getReply = async (messages) => {
 
   for (const provider of providers.filter((p) => p.enabled)) {
     try {
-      const { text, usage } = await provider.request(messages);
+      const { text, usage, model } = await provider.request(messages);
       return {
         text,
         provider: provider.name,
-        model: provider.model,
+        model,
         usage,
-        cost: estimateCost(provider.model, usage),
+        cost: estimateCost(model, usage),
       };
     } catch (err) {
       friendlyErrors.push(describeProviderError(provider.name, err));
@@ -356,16 +399,16 @@ const streamReply = async (messages, send) => {
   for (const provider of providers.filter((p) => p.enabled)) {
     let startedStreaming = false;
     try {
-      const { usage } = await provider.stream(messages, (delta) => {
+      const { usage, model } = await provider.stream(messages, (delta) => {
         startedStreaming = true;
         send({ type: "chunk", text: delta });
       });
       send({
         type: "done",
         provider: provider.name,
-        model: provider.model,
+        model,
         usage,
-        cost: estimateCost(provider.model, usage),
+        cost: estimateCost(model, usage),
       });
       return;
     } catch (err) {
