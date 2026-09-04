@@ -23,6 +23,23 @@ const config = {
       .filter(Boolean),
     maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS || 1024),
   },
+  // Groq and Cerebras are both wholly free-tier inference services (not
+  // "free variant of a paid API" like OpenRouter) — a separate quota pool
+  // from Gemini and OpenRouter, so they're here purely for redundancy: if
+  // Gemini and OpenRouter both hit their limits at once (e.g. a burst of
+  // users), these are two more independent places to try before failing.
+  groq: {
+    apiKey: process.env.GROQ_API_KEY?.trim(),
+    baseUrl: "https://api.groq.com/openai/v1",
+    model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
+    maxTokens: Number(process.env.GROQ_MAX_TOKENS || 1024),
+  },
+  cerebras: {
+    apiKey: process.env.CEREBRAS_API_KEY?.trim(),
+    baseUrl: "https://api.cerebras.ai/v1",
+    model: process.env.CEREBRAS_MODEL || "gpt-oss-120b",
+    maxTokens: Number(process.env.CEREBRAS_MAX_TOKENS || 1024),
+  },
   openrouter: {
     apiKey: process.env.OPENAI_API_KEY?.trim(),
     baseUrl: process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1",
@@ -73,10 +90,12 @@ const chatLimiter = rateLimit({
 
 const ai = new GoogleGenAI({ apiKey: config.gemini.apiKey });
 
-// Google's "high demand" 503s are usually gone within a second or two, so a
-// short retry here rides them out instead of immediately burning the
-// OpenRouter fallback (and its own, unrelated budget) for a transient blip.
-const RETRYABLE_ERROR_PATTERN = /"code":\s*503|UNAVAILABLE|overloaded/i;
+// "High demand" 503s are usually gone within a second or two, so a short
+// retry here rides them out instead of immediately burning the next
+// provider's own, unrelated budget for a transient blip. Applies to every
+// OpenAI-compatible provider too (not just Gemini's JSON shape), hence the
+// bare \b503\b for a plain "<Provider> 503: ..." message.
+const RETRYABLE_ERROR_PATTERN = /"code":\s*503|UNAVAILABLE|overloaded|\b503\b/i;
 
 function isRetryableError(err) {
   return RETRYABLE_ERROR_PATTERN.test(err?.message || String(err));
@@ -110,6 +129,11 @@ const PRICING_USD_PER_MILLION_TOKENS = {
   "gemini-2.5-flash-lite": { input: 0.1, output: 0.4 },
   "gpt-4o": { input: 2.5, output: 10 },
   "gpt-4o-mini": { input: 0.15, output: 0.6 },
+  // Groq and Cerebras are used here purely as free-tier services — $0
+  // regardless of model, so these two entries just need to exist for
+  // whatever the configured default model is.
+  "llama-3.3-70b-versatile": { input: 0, output: 0 },
+  "gpt-oss-120b": { input: 0, output: 0 },
 };
 
 function estimateCost(model, usage) {
@@ -130,8 +154,15 @@ function estimateCost(model, usage) {
 // the server logs — showing it straight to the chat UI is both ugly and
 // unhelpful. This maps known failure shapes to a short, human sentence;
 // callers still log the untouched error alongside it for debugging.
+const PROVIDER_LABELS = {
+  gemini: "Gemini",
+  groq: "Groq",
+  cerebras: "Cerebras",
+  openrouter: "OpenRouter",
+};
+
 function describeProviderError(providerName, err) {
-  const label = providerName === "gemini" ? "Gemini" : "OpenRouter";
+  const label = PROVIDER_LABELS[providerName] || providerName;
   const msg = err?.message || String(err);
 
   if (/"code":\s*503|UNAVAILABLE|overloaded/i.test(msg)) {
@@ -147,6 +178,126 @@ function describeProviderError(providerName, err) {
     return `${label} rejected the API key`;
   }
   return `${label} request failed`;
+}
+
+// Shared implementation for any provider exposing an OpenAI-compatible
+// /chat/completions endpoint (OpenRouter, Groq, Cerebras, ...). `cfg` needs
+// { apiKey, baseUrl, model, maxTokens }.
+function makeOpenAICompatibleProvider(name, cfg) {
+  return {
+    name,
+    enabled: Boolean(cfg.apiKey),
+    request: async (messages) => {
+      const response = await withRetries(() =>
+        fetch(`${cfg.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${cfg.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: cfg.model,
+            messages,
+            max_tokens: cfg.maxTokens,
+            temperature: 0.7,
+          }),
+        }).then(async (res) => {
+          const body = await res.text();
+          if (!res.ok) throw new Error(`${name} ${res.status}: ${body}`);
+          return body;
+        }),
+      );
+
+      const data = JSON.parse(response);
+      const text = data.choices?.[0]?.message?.content;
+      if (!text) {
+        throw new Error(`${name} returned no text`);
+      }
+
+      const usage = data.usage
+        ? {
+            inputTokens: data.usage.prompt_tokens || 0,
+            outputTokens: data.usage.completion_tokens || 0,
+          }
+        : null;
+
+      return { text, usage, model: cfg.model };
+    },
+    stream: async (messages, onDelta) => {
+      // Only the call that opens the stream is retried, same reasoning as
+      // Gemini's stream() — see the comment there.
+      const response = await withRetries(() =>
+        fetch(`${cfg.baseUrl}/chat/completions`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${cfg.apiKey}`,
+          },
+          body: JSON.stringify({
+            model: cfg.model,
+            messages,
+            max_tokens: cfg.maxTokens,
+            temperature: 0.7,
+            stream: true,
+            stream_options: { include_usage: true },
+          }),
+        }).then(async (res) => {
+          if (!res.ok) {
+            const body = await res.text();
+            throw new Error(`${name} ${res.status}: ${body}`);
+          }
+          return res;
+        }),
+      );
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let usage = null;
+      let gotAnyText = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let sepIndex;
+        while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+          const rawEvent = buffer.slice(0, sepIndex).trim();
+          buffer = buffer.slice(sepIndex + 2);
+
+          if (!rawEvent.startsWith("data:")) continue;
+          const payload = rawEvent.slice(5).trim();
+          if (payload === "[DONE]") continue;
+
+          let json;
+          try {
+            json = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+
+          const delta = json.choices?.[0]?.delta?.content;
+          if (delta) {
+            gotAnyText = true;
+            onDelta(delta);
+          }
+          if (json.usage) {
+            usage = {
+              inputTokens: json.usage.prompt_tokens || 0,
+              outputTokens: json.usage.completion_tokens || 0,
+            };
+          }
+        }
+      }
+
+      if (!gotAnyText) {
+        throw new Error(`${name} streamed no text`);
+      }
+
+      return { usage, model: cfg.model };
+    },
+  };
 }
 
 const providers = [
@@ -255,114 +406,9 @@ const providers = [
       throw new Error(modelErrors.join(" | "));
     },
   },
-  {
-    name: "openrouter",
-    enabled: Boolean(config.openrouter.apiKey),
-    request: async (messages) => {
-      const response = await fetch(`${config.openrouter.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.openrouter.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: config.openrouter.model,
-          messages,
-          max_tokens: config.openrouter.maxTokens,
-          temperature: 0.7,
-        }),
-      });
-
-      const body = await response.text();
-      if (!response.ok) {
-        throw new Error(`OpenRouter ${response.status}: ${body}`);
-      }
-
-      const data = JSON.parse(body);
-      const text = data.choices?.[0]?.message?.content;
-      if (!text) {
-        throw new Error("OpenRouter returned no text");
-      }
-
-      const usage = data.usage
-        ? {
-            inputTokens: data.usage.prompt_tokens || 0,
-            outputTokens: data.usage.completion_tokens || 0,
-          }
-        : null;
-
-      return { text, usage, model: config.openrouter.model };
-    },
-    stream: async (messages, onDelta) => {
-      const response = await fetch(`${config.openrouter.baseUrl}/chat/completions`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.openrouter.apiKey}`,
-        },
-        body: JSON.stringify({
-          model: config.openrouter.model,
-          messages,
-          max_tokens: config.openrouter.maxTokens,
-          temperature: 0.7,
-          stream: true,
-          stream_options: { include_usage: true },
-        }),
-      });
-
-      if (!response.ok) {
-        const body = await response.text();
-        throw new Error(`OpenRouter ${response.status}: ${body}`);
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let usage = null;
-      let gotAnyText = false;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-
-        let sepIndex;
-        while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
-          const rawEvent = buffer.slice(0, sepIndex).trim();
-          buffer = buffer.slice(sepIndex + 2);
-
-          if (!rawEvent.startsWith("data:")) continue;
-          const payload = rawEvent.slice(5).trim();
-          if (payload === "[DONE]") continue;
-
-          let json;
-          try {
-            json = JSON.parse(payload);
-          } catch {
-            continue;
-          }
-
-          const delta = json.choices?.[0]?.delta?.content;
-          if (delta) {
-            gotAnyText = true;
-            onDelta(delta);
-          }
-          if (json.usage) {
-            usage = {
-              inputTokens: json.usage.prompt_tokens || 0,
-              outputTokens: json.usage.completion_tokens || 0,
-            };
-          }
-        }
-      }
-
-      if (!gotAnyText) {
-        throw new Error("OpenRouter streamed no text");
-      }
-
-      return { usage, model: config.openrouter.model };
-    },
-  },
+  makeOpenAICompatibleProvider("groq", config.groq),
+  makeOpenAICompatibleProvider("cerebras", config.cerebras),
+  makeOpenAICompatibleProvider("openrouter", config.openrouter),
 ];
 
 const getReply = async (messages) => {
@@ -427,6 +473,12 @@ const streamReply = async (messages, send) => {
 
 if (!config.gemini.apiKey) {
   console.warn("⚠️ GEMINI_API_KEY is not configured — Gemini will be skipped.");
+}
+if (!config.groq.apiKey) {
+  console.warn("⚠️ GROQ_API_KEY is not configured — Groq will be skipped.");
+}
+if (!config.cerebras.apiKey) {
+  console.warn("⚠️ CEREBRAS_API_KEY is not configured — Cerebras will be skipped.");
 }
 if (!config.openrouter.apiKey) {
   console.warn("⚠️ OPENAI_API_KEY is not configured — OpenRouter will be skipped.");
