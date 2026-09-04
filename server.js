@@ -61,9 +61,33 @@ const chatLimiter = rateLimit({
 
 const ai = new GoogleGenAI({ apiKey: config.gemini.apiKey });
 
+// Best-effort snapshot of $ / 1M tokens, keyed by the exact model id each
+// provider is configured with. Prices move over time (e.g. "gemini-flash-latest"
+// is an alias Google repoints to a new model+price periodically) — treat this
+// as an approximation, not a billing-grade source of truth, and refresh it
+// when providers change their pricing. Unknown models return a null cost
+// rather than silently charging the wrong price.
+const PRICING_USD_PER_MILLION_TOKENS = {
+  "gemini-flash-latest": { input: 0.75, output: 3.75 },
+  "gemini-2.5-flash": { input: 0.15, output: 1.25 },
+  "gemini-2.5-flash-lite": { input: 0.1, output: 0.4 },
+  "gpt-4o": { input: 2.5, output: 10 },
+  "gpt-4o-mini": { input: 0.15, output: 0.6 },
+};
+
+function estimateCost(model, usage) {
+  const pricing = PRICING_USD_PER_MILLION_TOKENS[model];
+  if (!pricing || !usage) return null;
+  return (
+    (usage.inputTokens / 1_000_000) * pricing.input +
+    (usage.outputTokens / 1_000_000) * pricing.output
+  );
+}
+
 const providers = [
   {
     name: "gemini",
+    model: config.gemini.model,
     enabled: Boolean(config.gemini.apiKey),
     request: async (messages) => {
       const prompt = messages
@@ -83,11 +107,21 @@ const providers = [
       if (!text) {
         throw new Error(`Gemini returned no text. Response structure: ${JSON.stringify(response)}`);
       }
-      return text;
+
+      const usageMeta = response.usageMetadata;
+      const usage = usageMeta
+        ? {
+            inputTokens: usageMeta.promptTokenCount || 0,
+            outputTokens: usageMeta.candidatesTokenCount || 0,
+          }
+        : null;
+
+      return { text, usage };
     },
   },
   {
     name: "openrouter",
+    model: config.openrouter.model,
     enabled: Boolean(config.openrouter.apiKey),
     request: async (messages) => {
       const response = await fetch(`${config.openrouter.baseUrl}/chat/completions`, {
@@ -114,7 +148,15 @@ const providers = [
       if (!text) {
         throw new Error("OpenRouter returned no text");
       }
-      return text;
+
+      const usage = data.usage
+        ? {
+            inputTokens: data.usage.prompt_tokens || 0,
+            outputTokens: data.usage.completion_tokens || 0,
+          }
+        : null;
+
+      return { text, usage };
     },
   },
 ];
@@ -124,7 +166,14 @@ const getReply = async (messages) => {
 
   for (const provider of providers.filter((p) => p.enabled)) {
     try {
-      return await provider.request(messages);
+      const { text, usage } = await provider.request(messages);
+      return {
+        text,
+        provider: provider.name,
+        model: provider.model,
+        usage,
+        cost: estimateCost(provider.model, usage),
+      };
     } catch (err) {
       errors.push(`${provider.name}: ${err.message || err}`);
       console.warn(`⚠️ ${provider.name} fallback error:`, err.message || err);
@@ -152,9 +201,9 @@ app.post("/chat", chatLimiter, async (req, res) => {
   }
 
   try {
-    const reply = await getReply(messages);
-    console.log("✅ Reply:", reply.slice(0, 100) + "...");
-    res.json({ reply });
+    const { text, provider, model, usage, cost } = await getReply(messages);
+    console.log("✅ Reply:", text.slice(0, 100) + "...");
+    res.json({ reply: text, provider, model, usage, cost });
   } catch (err) {
     console.error("❌ Chat error:", err.message || err);
     res.status(500).json({ error: "Error while requesting AI providers", details: err.message || err });
