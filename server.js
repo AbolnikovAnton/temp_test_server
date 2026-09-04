@@ -1,5 +1,6 @@
 import express from "express";
 import cors from "cors";
+import rateLimit from "express-rate-limit";
 import dotenv from "dotenv";
 import { GoogleGenAI } from "@google/genai";
 
@@ -12,6 +13,7 @@ const config = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY?.trim(),
     model: process.env.GEMINI_MODEL || "gemini-flash-latest",
+    maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS || 1024),
   },
   openrouter: {
     apiKey: process.env.OPENAI_API_KEY?.trim(),
@@ -20,6 +22,42 @@ const config = {
     maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 1024),
   },
 };
+
+// Origins allowed to call this API. The client is a static site with no
+// secrets of its own, so this (plus the rate limiter below) is a best-effort
+// filter against casual/opportunistic abuse of the paid AI providers behind
+// this server — not a strong auth boundary, since Origin can be spoofed by a
+// non-browser client. It's the right tradeoff for a personal project.
+const DEFAULT_ALLOWED_ORIGINS = ["https://abolnikovanton.github.io"];
+const envOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const allowedOrigins = [...DEFAULT_ALLOWED_ORIGINS, ...envOrigins];
+
+function isLocalhostOrigin(origin) {
+  return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin);
+}
+
+function isAllowedOrigin(origin) {
+  if (!origin) return false;
+  return allowedOrigins.includes(origin) || isLocalhostOrigin(origin);
+}
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (isAllowedOrigin(origin)) return callback(null, true);
+    return callback(new Error("Not allowed by CORS"));
+  },
+};
+
+const chatLimiter = rateLimit({
+  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS || 15 * 60 * 1000),
+  max: Number(process.env.RATE_LIMIT_MAX || 60),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests, please try again later." },
+});
 
 const ai = new GoogleGenAI({ apiKey: config.gemini.apiKey });
 
@@ -38,6 +76,7 @@ const providers = [
       const response = await ai.models.generateContent({
         model: config.gemini.model,
         contents: prompt,
+        config: { maxOutputTokens: config.gemini.maxOutputTokens },
       });
 
       const text = response.text || response.output?.[0]?.content?.[0]?.text;
@@ -102,11 +141,11 @@ if (!config.openrouter.apiKey) {
   console.warn("⚠️ OPENAI_API_KEY is not configured — OpenRouter will be skipped.");
 }
 
-app.use(cors());
-app.options("/*splat", cors());
+app.use(cors(corsOptions));
+app.options("/*splat", cors(corsOptions));
 app.use(express.json());
 
-app.post("/chat", async (req, res) => {
+app.post("/chat", chatLimiter, async (req, res) => {
   const { messages } = req.body;
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: "Invalid messages format" });
@@ -120,6 +159,15 @@ app.post("/chat", async (req, res) => {
     console.error("❌ Chat error:", err.message || err);
     res.status(500).json({ error: "Error while requesting AI providers", details: err.message || err });
   }
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  if (err && err.message === "Not allowed by CORS") {
+    return res.status(403).json({ error: "Origin not allowed" });
+  }
+  console.error("❌ Unhandled error:", err);
+  res.status(500).json({ error: "Internal server error" });
 });
 
 app.listen(port, () => {
