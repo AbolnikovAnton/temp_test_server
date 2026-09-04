@@ -61,6 +61,31 @@ const chatLimiter = rateLimit({
 
 const ai = new GoogleGenAI({ apiKey: config.gemini.apiKey });
 
+// Google's "high demand" 503s are usually gone within a second or two, so a
+// short retry here rides them out instead of immediately burning the
+// OpenRouter fallback (and its own, unrelated budget) for a transient blip.
+const RETRYABLE_ERROR_PATTERN = /"code":\s*503|UNAVAILABLE|overloaded/i;
+
+function isRetryableError(err) {
+  return RETRYABLE_ERROR_PATTERN.test(err?.message || String(err));
+}
+
+async function withRetries(fn, { attempts = 3, baseDelayMs = 500 } = {}) {
+  let lastErr;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === attempts - 1 || !isRetryableError(err)) throw err;
+      const delay = baseDelayMs * 2 ** attempt;
+      console.warn(`⚠️ Retryable error, waiting ${delay}ms before retry ${attempt + 2}/${attempts}:`, err.message || err);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  throw lastErr;
+}
+
 // Best-effort snapshot of $ / 1M tokens, keyed by the exact model id each
 // provider is configured with. Prices move over time (e.g. "gemini-flash-latest"
 // is an alias Google repoints to a new model+price periodically) — treat this
@@ -97,11 +122,13 @@ const providers = [
         })
         .join("\n");
 
-      const response = await ai.models.generateContent({
-        model: config.gemini.model,
-        contents: prompt,
-        config: { maxOutputTokens: config.gemini.maxOutputTokens },
-      });
+      const response = await withRetries(() =>
+        ai.models.generateContent({
+          model: config.gemini.model,
+          contents: prompt,
+          config: { maxOutputTokens: config.gemini.maxOutputTokens },
+        }),
+      );
 
       const text = response.text || response.output?.[0]?.content?.[0]?.text;
       if (!text) {
@@ -126,11 +153,17 @@ const providers = [
         })
         .join("\n");
 
-      const responseStream = await ai.models.generateContentStream({
-        model: config.gemini.model,
-        contents: prompt,
-        config: { maxOutputTokens: config.gemini.maxOutputTokens },
-      });
+      // Only the call that opens the stream is retried — once tokens have
+      // started reaching the client (below), a later failure is handled by
+      // the "startedStreaming" check in streamReply instead, not retried
+      // here with a fresh (and possibly duplicate) response.
+      const responseStream = await withRetries(() =>
+        ai.models.generateContentStream({
+          model: config.gemini.model,
+          contents: prompt,
+          config: { maxOutputTokens: config.gemini.maxOutputTokens },
+        }),
+      );
 
       let usage = null;
       let gotAnyText = false;
