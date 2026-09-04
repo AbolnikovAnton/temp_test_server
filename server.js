@@ -109,6 +109,29 @@ function estimateCost(model, usage) {
   );
 }
 
+// The full provider error (raw JSON, stack traces, etc.) is only useful in
+// the server logs — showing it straight to the chat UI is both ugly and
+// unhelpful. This maps known failure shapes to a short, human sentence;
+// callers still log the untouched error alongside it for debugging.
+function describeProviderError(providerName, err) {
+  const label = providerName === "gemini" ? "Gemini" : "OpenRouter";
+  const msg = err?.message || String(err);
+
+  if (/"code":\s*503|UNAVAILABLE|overloaded/i.test(msg)) {
+    return `${label} is temporarily overloaded — try again in a moment`;
+  }
+  if (/"code":\s*402|insufficient.*credit|requires more credits/i.test(msg)) {
+    return `${label} is out of credits`;
+  }
+  if (/"code":\s*429|rate.?limit|quota/i.test(msg)) {
+    return `${label} rate limit or quota reached`;
+  }
+  if (/"code":\s*401|unauthorized|invalid.*api.?key/i.test(msg)) {
+    return `${label} rejected the API key`;
+  }
+  return `${label} request failed`;
+}
+
 const providers = [
   {
     name: "gemini",
@@ -300,7 +323,7 @@ const providers = [
 ];
 
 const getReply = async (messages) => {
-  const errors = [];
+  const friendlyErrors = [];
 
   for (const provider of providers.filter((p) => p.enabled)) {
     try {
@@ -313,12 +336,12 @@ const getReply = async (messages) => {
         cost: estimateCost(provider.model, usage),
       };
     } catch (err) {
-      errors.push(`${provider.name}: ${err.message || err}`);
+      friendlyErrors.push(describeProviderError(provider.name, err));
       console.warn(`⚠️ ${provider.name} fallback error:`, err.message || err);
     }
   }
 
-  throw new Error(errors.length ? errors.join(" | ") : "No provider is configured");
+  throw new Error(friendlyErrors.length ? friendlyErrors.join(" · ") : "No provider is configured");
 };
 
 // Streams SSE events to the client as text arrives: {type:"chunk", text}
@@ -328,7 +351,7 @@ const getReply = async (messages) => {
 // providers mid-reply would just confuse the conversation, so a later
 // failure ends the stream with an error instead of retrying silently.
 const streamReply = async (messages, send) => {
-  const errors = [];
+  const friendlyErrors = [];
 
   for (const provider of providers.filter((p) => p.enabled)) {
     let startedStreaming = false;
@@ -346,16 +369,17 @@ const streamReply = async (messages, send) => {
       });
       return;
     } catch (err) {
-      errors.push(`${provider.name}: ${err.message || err}`);
+      const friendly = describeProviderError(provider.name, err);
+      friendlyErrors.push(friendly);
       console.warn(`⚠️ ${provider.name} streaming fallback error:`, err.message || err);
       if (startedStreaming) {
-        send({ type: "error", error: `${provider.name} failed mid-stream: ${err.message || err}` });
+        send({ type: "error", error: `${friendly} — reply cut short` });
         return;
       }
     }
   }
 
-  send({ type: "error", error: errors.length ? errors.join(" | ") : "No provider is configured" });
+  send({ type: "error", error: friendlyErrors.length ? friendlyErrors.join(" · ") : "No provider is configured" });
 };
 
 if (!config.gemini.apiKey) {
