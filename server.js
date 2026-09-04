@@ -118,6 +118,42 @@ const providers = [
 
       return { text, usage };
     },
+    stream: async (messages, onDelta) => {
+      const prompt = messages
+        .map((message) => {
+          const role = message.role === "assistant" ? "Assistant" : message.role === "user" ? "User" : message.role;
+          return `${role}: ${message.content}`;
+        })
+        .join("\n");
+
+      const responseStream = await ai.models.generateContentStream({
+        model: config.gemini.model,
+        contents: prompt,
+        config: { maxOutputTokens: config.gemini.maxOutputTokens },
+      });
+
+      let usage = null;
+      let gotAnyText = false;
+
+      for await (const chunk of responseStream) {
+        if (chunk.text) {
+          gotAnyText = true;
+          onDelta(chunk.text);
+        }
+        if (chunk.usageMetadata) {
+          usage = {
+            inputTokens: chunk.usageMetadata.promptTokenCount || 0,
+            outputTokens: chunk.usageMetadata.candidatesTokenCount || 0,
+          };
+        }
+      }
+
+      if (!gotAnyText) {
+        throw new Error("Gemini streamed no text");
+      }
+
+      return { usage };
+    },
   },
   {
     name: "openrouter",
@@ -158,6 +194,75 @@ const providers = [
 
       return { text, usage };
     },
+    stream: async (messages, onDelta) => {
+      const response = await fetch(`${config.openrouter.baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.openrouter.apiKey}`,
+        },
+        body: JSON.stringify({
+          model: config.openrouter.model,
+          messages,
+          max_tokens: config.openrouter.maxTokens,
+          temperature: 0.7,
+          stream: true,
+          stream_options: { include_usage: true },
+        }),
+      });
+
+      if (!response.ok) {
+        const body = await response.text();
+        throw new Error(`OpenRouter ${response.status}: ${body}`);
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let usage = null;
+      let gotAnyText = false;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        let sepIndex;
+        while ((sepIndex = buffer.indexOf("\n\n")) !== -1) {
+          const rawEvent = buffer.slice(0, sepIndex).trim();
+          buffer = buffer.slice(sepIndex + 2);
+
+          if (!rawEvent.startsWith("data:")) continue;
+          const payload = rawEvent.slice(5).trim();
+          if (payload === "[DONE]") continue;
+
+          let json;
+          try {
+            json = JSON.parse(payload);
+          } catch {
+            continue;
+          }
+
+          const delta = json.choices?.[0]?.delta?.content;
+          if (delta) {
+            gotAnyText = true;
+            onDelta(delta);
+          }
+          if (json.usage) {
+            usage = {
+              inputTokens: json.usage.prompt_tokens || 0,
+              outputTokens: json.usage.completion_tokens || 0,
+            };
+          }
+        }
+      }
+
+      if (!gotAnyText) {
+        throw new Error("OpenRouter streamed no text");
+      }
+
+      return { usage };
+    },
   },
 ];
 
@@ -183,6 +288,43 @@ const getReply = async (messages) => {
   throw new Error(errors.length ? errors.join(" | ") : "No provider is configured");
 };
 
+// Streams SSE events to the client as text arrives: {type:"chunk", text}
+// while generating, then one {type:"done", ...} or {type:"error", ...}.
+// Fallback to the next provider only works before any text has reached the
+// client for this turn — once a provider has streamed something, switching
+// providers mid-reply would just confuse the conversation, so a later
+// failure ends the stream with an error instead of retrying silently.
+const streamReply = async (messages, send) => {
+  const errors = [];
+
+  for (const provider of providers.filter((p) => p.enabled)) {
+    let startedStreaming = false;
+    try {
+      const { usage } = await provider.stream(messages, (delta) => {
+        startedStreaming = true;
+        send({ type: "chunk", text: delta });
+      });
+      send({
+        type: "done",
+        provider: provider.name,
+        model: provider.model,
+        usage,
+        cost: estimateCost(provider.model, usage),
+      });
+      return;
+    } catch (err) {
+      errors.push(`${provider.name}: ${err.message || err}`);
+      console.warn(`⚠️ ${provider.name} streaming fallback error:`, err.message || err);
+      if (startedStreaming) {
+        send({ type: "error", error: `${provider.name} failed mid-stream: ${err.message || err}` });
+        return;
+      }
+    }
+  }
+
+  send({ type: "error", error: errors.length ? errors.join(" | ") : "No provider is configured" });
+};
+
 if (!config.gemini.apiKey) {
   console.warn("⚠️ GEMINI_API_KEY is not configured — Gemini will be skipped.");
 }
@@ -195,18 +337,38 @@ app.options("/*splat", cors(corsOptions));
 app.use(express.json());
 
 app.post("/chat", chatLimiter, async (req, res) => {
-  const { messages } = req.body;
+  const { messages, stream } = req.body;
   if (!messages || !Array.isArray(messages)) {
     return res.status(400).json({ error: "Invalid messages format" });
   }
 
+  if (!stream) {
+    try {
+      const { text, provider, model, usage, cost } = await getReply(messages);
+      console.log("✅ Reply:", text.slice(0, 100) + "...");
+      res.json({ reply: text, provider, model, usage, cost });
+    } catch (err) {
+      console.error("❌ Chat error:", err.message || err);
+      res.status(500).json({ error: "Error while requesting AI providers", details: err.message || err });
+    }
+    return;
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
   try {
-    const { text, provider, model, usage, cost } = await getReply(messages);
-    console.log("✅ Reply:", text.slice(0, 100) + "...");
-    res.json({ reply: text, provider, model, usage, cost });
+    await streamReply(messages, send);
   } catch (err) {
-    console.error("❌ Chat error:", err.message || err);
-    res.status(500).json({ error: "Error while requesting AI providers", details: err.message || err });
+    console.error("❌ Streaming chat error:", err.message || err);
+    send({ type: "error", error: err.message || String(err) });
+  } finally {
+    res.end();
   }
 });
 
