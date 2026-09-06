@@ -27,7 +27,7 @@ const config = {
       .split(",")
       .map((model) => model.trim())
       .filter(Boolean),
-    maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS || 2048),
+    maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS || 4096),
   },
   // Groq and Cerebras are both wholly free-tier inference services (not
   // "free variant of a paid API" like OpenRouter) — a separate quota pool
@@ -38,13 +38,13 @@ const config = {
     apiKey: process.env.GROQ_API_KEY?.trim(),
     baseUrl: "https://api.groq.com/openai/v1",
     model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
-    maxTokens: Number(process.env.GROQ_MAX_TOKENS || 2048),
+    maxTokens: Number(process.env.GROQ_MAX_TOKENS || 4096),
   },
   cerebras: {
     apiKey: process.env.CEREBRAS_API_KEY?.trim(),
     baseUrl: "https://api.cerebras.ai/v1",
     model: process.env.CEREBRAS_MODEL || "gpt-oss-120b",
-    maxTokens: Number(process.env.CEREBRAS_MAX_TOKENS || 2048),
+    maxTokens: Number(process.env.CEREBRAS_MAX_TOKENS || 4096),
   },
   openrouter: {
     apiKey: process.env.OPENAI_API_KEY?.trim(),
@@ -54,7 +54,7 @@ const config = {
     // $10 lifetime credit purchase, per OpenRouter's own docs). See
     // https://openrouter.ai/models?variant=free for the current list.
     model: process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
-    maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 2048),
+    maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 4096),
   },
 };
 
@@ -242,7 +242,12 @@ function makeOpenAICompatibleProvider(name, cfg, { includeStreamUsage = false } 
           }
         : null;
 
-      return { text, usage, model: cfg.model };
+      // "length" means the model hit max_tokens and was cut off mid-thought,
+      // not that it actually finished — worth telling the client apart from
+      // a normal "stop".
+      const truncated = data.choices?.[0]?.finish_reason === "length";
+
+      return { text, usage, model: cfg.model, truncated };
     },
     stream: async (messages, onDelta) => {
       // Only the call that opens the stream is retried, same reasoning as
@@ -276,6 +281,7 @@ function makeOpenAICompatibleProvider(name, cfg, { includeStreamUsage = false } 
       let buffer = "";
       let usage = null;
       let gotAnyText = false;
+      let truncated = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -303,6 +309,9 @@ function makeOpenAICompatibleProvider(name, cfg, { includeStreamUsage = false } 
             gotAnyText = true;
             onDelta(delta);
           }
+          if (json.choices?.[0]?.finish_reason === "length") {
+            truncated = true;
+          }
           if (json.usage) {
             usage = {
               inputTokens: json.usage.prompt_tokens || 0,
@@ -316,7 +325,7 @@ function makeOpenAICompatibleProvider(name, cfg, { includeStreamUsage = false } 
         throw new Error(`${name} streamed no text`);
       }
 
-      return { usage, model: cfg.model };
+      return { usage, model: cfg.model, truncated };
     },
   };
 }
@@ -358,7 +367,9 @@ const providers = [
               }
             : null;
 
-          return { text, usage, model };
+          const truncated = response.candidates?.[0]?.finishReason === "MAX_TOKENS";
+
+          return { text, usage, model, truncated };
         } catch (err) {
           modelErrors.push(`${model}: ${err.message || err}`);
           console.warn(`⚠️ Gemini model "${model}" failed, trying next:`, err.message || err);
@@ -394,6 +405,7 @@ const providers = [
 
           let usage = null;
           let gotAnyText = false;
+          let truncated = false;
 
           for await (const chunk of responseStream) {
             if (chunk.text) {
@@ -407,13 +419,16 @@ const providers = [
                 outputTokens: chunk.usageMetadata.candidatesTokenCount || 0,
               };
             }
+            if (chunk.candidates?.[0]?.finishReason === "MAX_TOKENS") {
+              truncated = true;
+            }
           }
 
           if (!gotAnyText) {
             throw new Error("streamed no text");
           }
 
-          return { usage, model };
+          return { usage, model, truncated };
         } catch (err) {
           modelErrors.push(`${model}: ${err.message || err}`);
           if (startedForThisModel) {
@@ -438,13 +453,14 @@ const getReply = async (messages) => {
 
   for (const provider of providers.filter((p) => p.enabled)) {
     try {
-      const { text, usage, model } = await provider.request(messages);
+      const { text, usage, model, truncated } = await provider.request(messages);
       return {
         text,
         provider: provider.name,
         model,
         usage,
         cost: estimateCost(model, usage),
+        truncated: Boolean(truncated),
       };
     } catch (err) {
       friendlyErrors.push(describeProviderError(provider.name, err));
@@ -467,7 +483,7 @@ const streamReply = async (messages, send) => {
   for (const provider of providers.filter((p) => p.enabled)) {
     let startedStreaming = false;
     try {
-      const { usage, model } = await provider.stream(messages, (delta) => {
+      const { usage, model, truncated } = await provider.stream(messages, (delta) => {
         startedStreaming = true;
         send({ type: "chunk", text: delta });
       });
@@ -477,6 +493,7 @@ const streamReply = async (messages, send) => {
         model,
         usage,
         cost: estimateCost(model, usage),
+        truncated: Boolean(truncated),
       });
       return;
     } catch (err) {
@@ -532,9 +549,9 @@ app.post("/chat", chatLimiter, async (req, res) => {
 
   if (!stream) {
     try {
-      const { text, provider, model, usage, cost } = await getReply(messages);
+      const { text, provider, model, usage, cost, truncated } = await getReply(messages);
       console.log("✅ Reply:", text.slice(0, 100) + "...");
-      res.json({ reply: text, provider, model, usage, cost });
+      res.json({ reply: text, provider, model, usage, cost, truncated });
     } catch (err) {
       console.error("❌ Chat error:", err.message || err);
       res.status(500).json({ error: "Error while requesting AI providers", details: err.message || err });
