@@ -21,7 +21,7 @@ const config = {
       .split(",")
       .map((model) => model.trim())
       .filter(Boolean),
-    maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS || 1024),
+    maxOutputTokens: Number(process.env.GEMINI_MAX_TOKENS || 2048),
   },
   // Groq and Cerebras are both wholly free-tier inference services (not
   // "free variant of a paid API" like OpenRouter) — a separate quota pool
@@ -32,13 +32,13 @@ const config = {
     apiKey: process.env.GROQ_API_KEY?.trim(),
     baseUrl: "https://api.groq.com/openai/v1",
     model: process.env.GROQ_MODEL || "llama-3.3-70b-versatile",
-    maxTokens: Number(process.env.GROQ_MAX_TOKENS || 1024),
+    maxTokens: Number(process.env.GROQ_MAX_TOKENS || 2048),
   },
   cerebras: {
     apiKey: process.env.CEREBRAS_API_KEY?.trim(),
     baseUrl: "https://api.cerebras.ai/v1",
     model: process.env.CEREBRAS_MODEL || "gpt-oss-120b",
-    maxTokens: Number(process.env.CEREBRAS_MAX_TOKENS || 1024),
+    maxTokens: Number(process.env.CEREBRAS_MAX_TOKENS || 2048),
   },
   openrouter: {
     apiKey: process.env.OPENAI_API_KEY?.trim(),
@@ -48,7 +48,7 @@ const config = {
     // $10 lifetime credit purchase, per OpenRouter's own docs). See
     // https://openrouter.ai/models?variant=free for the current list.
     model: process.env.OPENROUTER_MODEL || "z-ai/glm-5.2:free",
-    maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 1024),
+    maxTokens: Number(process.env.OPENROUTER_MAX_TOKENS || 2048),
   },
 };
 
@@ -177,13 +177,28 @@ function describeProviderError(providerName, err) {
   if (/"code":\s*401|unauthorized|invalid.*api.?key/i.test(msg)) {
     return `${label} rejected the API key`;
   }
-  return `${label} request failed`;
+  if (/model.*not.*found|does not exist|unknown model|invalid model/i.test(msg)) {
+    return `${label} rejected the configured model — check its model id is still valid`;
+  }
+
+  // Unknown failure shape: still surface the HTTP status if we have one —
+  // our own errors are formatted as "<Provider> <status>: <body>" — instead
+  // of a completely opaque "request failed". The full body is still in the
+  // server logs via console.warn for real debugging.
+  const statusMatch = msg.match(/^\S+\s+(\d{3}):/);
+  return statusMatch ? `${label} request failed (HTTP ${statusMatch[1]})` : `${label} request failed`;
 }
 
 // Shared implementation for any provider exposing an OpenAI-compatible
 // /chat/completions endpoint (OpenRouter, Groq, Cerebras, ...). `cfg` needs
-// { apiKey, baseUrl, model, maxTokens }.
-function makeOpenAICompatibleProvider(name, cfg) {
+// { apiKey, baseUrl, model, maxTokens }. `includeStreamUsage` sends
+// stream_options: { include_usage: true } during streaming to get real
+// token counts — OpenAI-compatible in *spec*, but not every provider
+// actually implements it, and some reject unrecognized fields outright with
+// a 400 instead of ignoring them. Off by default; only flip it on for a
+// provider once you've confirmed it doesn't break the stream — usage just
+// comes back null otherwise (already handled gracefully everywhere).
+function makeOpenAICompatibleProvider(name, cfg, { includeStreamUsage = false } = {}) {
   return {
     name,
     enabled: Boolean(cfg.apiKey),
@@ -239,7 +254,7 @@ function makeOpenAICompatibleProvider(name, cfg) {
             max_tokens: cfg.maxTokens,
             temperature: 0.7,
             stream: true,
-            stream_options: { include_usage: true },
+            ...(includeStreamUsage ? { stream_options: { include_usage: true } } : {}),
           }),
         }).then(async (res) => {
           if (!res.ok) {
@@ -408,7 +423,8 @@ const providers = [
   },
   makeOpenAICompatibleProvider("groq", config.groq),
   makeOpenAICompatibleProvider("cerebras", config.cerebras),
-  makeOpenAICompatibleProvider("openrouter", config.openrouter),
+  // Confirmed working via live testing — OpenRouter does return usage this way.
+  makeOpenAICompatibleProvider("openrouter", config.openrouter, { includeStreamUsage: true }),
 ];
 
 const getReply = async (messages) => {
