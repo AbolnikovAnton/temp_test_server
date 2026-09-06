@@ -123,6 +123,33 @@ async function withRetries(fn, { attempts = 3, baseDelayMs = 500 } = {}) {
   throw lastErr;
 }
 
+// Quota/rate-limit errors (429, RESOURCE_EXHAUSTED, ...) mean this specific
+// model or provider is out of budget right now — retrying it a few seconds
+// later (e.g. the very next chat message, or an auto-continue firing right
+// after a truncated reply) is guaranteed to fail again and just burns a
+// round trip. Once one of these is seen, skip that model/provider outright
+// for a while instead of re-attempting it on every subsequent request.
+// In-memory only — resets on a redeploy/restart, which is fine, since
+// worst case we just re-learn it on the next real attempt.
+const QUOTA_ERROR_PATTERN = /"code":\s*429|RESOURCE_EXHAUSTED|rate.?limit|quota/i;
+const QUOTA_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutes
+const quotaCooldowns = new Map(); // key -> timestamp until which to skip
+
+function isQuotaError(err) {
+  return QUOTA_ERROR_PATTERN.test(err?.message || String(err));
+}
+
+function isOnCooldown(key) {
+  const until = quotaCooldowns.get(key);
+  return until != null && Date.now() < until;
+}
+
+function noteIfQuotaError(key, err) {
+  if (isQuotaError(err)) {
+    quotaCooldowns.set(key, Date.now() + QUOTA_COOLDOWN_MS);
+  }
+}
+
 // Best-effort snapshot of $ / 1M tokens, keyed by the exact model id each
 // provider is configured with. Prices move over time (e.g. "gemini-flash-latest"
 // is an alias Google repoints to a new model+price periodically) — treat this
@@ -345,6 +372,12 @@ const providers = [
       const modelErrors = [];
 
       for (const model of config.gemini.models) {
+        const cooldownKey = `gemini:${model}`;
+        if (isOnCooldown(cooldownKey)) {
+          modelErrors.push(`${model}: skipped (recently hit quota, cooling down)`);
+          continue;
+        }
+
         try {
           const response = await withRetries(() =>
             ai.models.generateContent({
@@ -372,6 +405,7 @@ const providers = [
           return { text, usage, model, truncated };
         } catch (err) {
           modelErrors.push(`${model}: ${err.message || err}`);
+          noteIfQuotaError(cooldownKey, err);
           console.warn(`⚠️ Gemini model "${model}" failed, trying next:`, err.message || err);
         }
       }
@@ -389,6 +423,12 @@ const providers = [
       const modelErrors = [];
 
       for (const model of config.gemini.models) {
+        const cooldownKey = `gemini:${model}`;
+        if (isOnCooldown(cooldownKey)) {
+          modelErrors.push(`${model}: skipped (recently hit quota, cooling down)`);
+          continue;
+        }
+
         let startedForThisModel = false;
         try {
           // Only the call that opens the stream is retried — once tokens
@@ -431,6 +471,7 @@ const providers = [
           return { usage, model, truncated };
         } catch (err) {
           modelErrors.push(`${model}: ${err.message || err}`);
+          noteIfQuotaError(cooldownKey, err);
           if (startedForThisModel) {
             console.warn(`⚠️ Gemini model "${model}" failed mid-stream:`, err.message || err);
             throw err;
@@ -452,6 +493,11 @@ const getReply = async (messages) => {
   const friendlyErrors = [];
 
   for (const provider of providers.filter((p) => p.enabled)) {
+    if (isOnCooldown(provider.name)) {
+      friendlyErrors.push(`${PROVIDER_LABELS[provider.name] || provider.name} skipped (cooling down)`);
+      continue;
+    }
+
     try {
       const { text, usage, model, truncated } = await provider.request(messages);
       return {
@@ -464,6 +510,7 @@ const getReply = async (messages) => {
       };
     } catch (err) {
       friendlyErrors.push(describeProviderError(provider.name, err));
+      noteIfQuotaError(provider.name, err);
       console.warn(`⚠️ ${provider.name} fallback error:`, err.message || err);
     }
   }
@@ -481,6 +528,11 @@ const streamReply = async (messages, send) => {
   const friendlyErrors = [];
 
   for (const provider of providers.filter((p) => p.enabled)) {
+    if (isOnCooldown(provider.name)) {
+      friendlyErrors.push(`${PROVIDER_LABELS[provider.name] || provider.name} skipped (cooling down)`);
+      continue;
+    }
+
     let startedStreaming = false;
     try {
       const { usage, model, truncated } = await provider.stream(messages, (delta) => {
@@ -499,6 +551,7 @@ const streamReply = async (messages, send) => {
     } catch (err) {
       const friendly = describeProviderError(provider.name, err);
       friendlyErrors.push(friendly);
+      noteIfQuotaError(provider.name, err);
       console.warn(`⚠️ ${provider.name} streaming fallback error:`, err.message || err);
       if (startedStreaming) {
         send({ type: "error", error: `${friendly} — reply cut short` });
