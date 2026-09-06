@@ -9,6 +9,12 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Render puts exactly one reverse proxy in front of this service, which
+// sets X-Forwarded-For. Without telling Express to trust that one hop,
+// express-rate-limit can't safely read the real client IP from it and
+// throws on every request instead of just using its own socket address.
+app.set("trust proxy", 1);
+
 const config = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY?.trim(),
@@ -17,7 +23,7 @@ const config = {
     // capacity. A brand-new "-latest" alias tends to launch with a *smaller*
     // introductory free quota than established models, so it goes first for
     // quality but the list gives us somewhere to go once it's exhausted.
-    models: (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-2.5-flash,gemini-2.5-flash-lite")
+    models: (process.env.GEMINI_MODELS || "gemini-flash-latest,gemini-3.6-flash,gemini-3.5-flash-lite")
       .split(",")
       .map((model) => model.trim())
       .filter(Boolean),
@@ -125,8 +131,8 @@ async function withRetries(fn, { attempts = 3, baseDelayMs = 500 } = {}) {
 // rather than silently charging the wrong price.
 const PRICING_USD_PER_MILLION_TOKENS = {
   "gemini-flash-latest": { input: 0.75, output: 3.75 },
-  "gemini-2.5-flash": { input: 0.15, output: 1.25 },
-  "gemini-2.5-flash-lite": { input: 0.1, output: 0.4 },
+  "gemini-3.6-flash": { input: 0.75, output: 3.75 }, // introductory rate; $1.50/$7.50 from 2027-01-01
+  "gemini-3.5-flash-lite": { input: 0.3, output: 2.5 },
   "gpt-4o": { input: 2.5, output: 10 },
   "gpt-4o-mini": { input: 0.15, output: 0.6 },
   // Groq and Cerebras are used here purely as free-tier services — $0
@@ -504,11 +510,25 @@ app.use(cors(corsOptions));
 app.options("/*splat", cors(corsOptions));
 app.use(express.json());
 
+// The client's chat history carries extra fields on each message (isError,
+// provider, model, timestamp — used for the UI: error styling, model badge,
+// timestamps) and buildMessagesForAPI() forwards those stored objects
+// as-is. Gemini never noticed (its request is a flattened text prompt, not
+// JSON) and OpenRouter tolerates unknown fields, but Groq and Cerebras
+// validate the messages schema strictly and reject the *entire* request —
+// "property 'isError' is unsupported" — the moment one shows up. Strip down
+// to {role, content} once, centrally, so every provider gets a clean array
+// regardless of how strict it is.
+function sanitizeMessages(messages) {
+  return messages.map(({ role, content }) => ({ role, content }));
+}
+
 app.post("/chat", chatLimiter, async (req, res) => {
-  const { messages, stream } = req.body;
-  if (!messages || !Array.isArray(messages)) {
+  const { stream } = req.body;
+  if (!req.body.messages || !Array.isArray(req.body.messages)) {
     return res.status(400).json({ error: "Invalid messages format" });
   }
+  const messages = sanitizeMessages(req.body.messages);
 
   if (!stream) {
     try {
